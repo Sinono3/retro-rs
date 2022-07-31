@@ -1,13 +1,16 @@
 use crate::buttons::Buttons;
+use crate::buttons::InputPort;
 use crate::error::*;
 use crate::pixels::*;
 use libc::c_char;
+use libc::c_int;
 use libloading::Library;
 use libloading::Symbol;
 use libretro_sys::*;
 use std::ffi::{c_void, CStr, CString};
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::panic;
 use std::path::{Path, PathBuf};
@@ -21,6 +24,7 @@ static mut CONTEXT: *mut EmulatorContext = ptr::null_mut();
 struct EmulatorCore {
     core_lib: Box<Library>,
     core_path: CString,
+    system_path: CString,
     rom_path: CString,
     core: CoreAPI,
     _marker: PhantomData<NotSendSync>,
@@ -28,7 +32,7 @@ struct EmulatorCore {
 
 struct EmulatorContext {
     audio_sample: Vec<i16>,
-    buttons: [Buttons; 2],
+    input_ports: [InputPort; 2],
     frame_ptr: *const c_void,
     frame_pitch: usize,
     frame_width: u32,
@@ -55,6 +59,8 @@ pub struct MemoryRegion {
 // Emulator token must not be send nor sync
 pub struct Emulator {
     phantom: PhantomData<NotSendSync>,
+    system_info: SystemInfo,
+    system_av_info: SystemAvInfo,
 }
 
 impl Emulator {
@@ -114,6 +120,9 @@ impl Emulator {
                 core_lib: dll,
                 rom_path: CString::new(rom_path.to_str().unwrap()).unwrap(),
                 core_path: CString::new(core_path.to_str().unwrap()).unwrap(),
+                system_path: {
+                    CString::new(core_path.with_extension("").to_str().unwrap()).unwrap()
+                },
                 core: CoreAPI {
                     retro_set_environment,
                     retro_set_video_refresh,
@@ -157,7 +166,7 @@ impl Emulator {
             // Forget the box so it doesn't drop
             let ctx = EmulatorContext {
                 audio_sample: Vec::new(),
-                buttons: [Buttons::new(), Buttons::new()],
+                input_ports: [InputPort::new(), InputPort::new()],
                 frame_ptr: ptr::null(),
                 frame_pitch: 0,
                 frame_width: 0,
@@ -180,14 +189,6 @@ impl Emulator {
             (emu.core.retro_set_input_state)(callback_input_state);
             // Load the game
             (emu.core.retro_init)();
-            let mut sys_info = SystemInfo {
-                library_name: ptr::null(),
-                library_version: ptr::null(),
-                valid_extensions: ptr::null(),
-                need_fullpath: false,
-                block_extract: false,
-            };
-            retro_get_system_info(&mut sys_info);
             let rom_cstr = &(*EMULATOR).rom_path;
 
             let mut rom_file = File::open(rom_path).unwrap();
@@ -200,8 +201,18 @@ impl Emulator {
                 size: buffer.len(),
                 meta: ptr::null(),
             };
-            (emu.core.retro_load_game)(&game_info);
-            let mut av_info = SystemAvInfo {
+
+            let load_game_successful = (emu.core.retro_load_game)(&game_info);
+            assert!(load_game_successful);
+
+            let mut system_info = SystemInfo {
+                library_name: ptr::null(),
+                library_version: ptr::null(),
+                valid_extensions: ptr::null(),
+                need_fullpath: false,
+                block_extract: false,
+            };
+            let mut system_av_info = SystemAvInfo {
                 geometry: GameGeometry {
                     base_width: 0,
                     base_height: 0,
@@ -214,9 +225,14 @@ impl Emulator {
                     sample_rate: 0.0,
                 },
             };
-            (retro_get_system_av_info)(&mut av_info);
+
+            (retro_get_system_info)(&mut system_info);
+            (retro_get_system_av_info)(&mut system_av_info);
+
             Emulator {
                 phantom: PhantomData,
+                system_info,
+                system_av_info,
             }
         }
     }
@@ -231,12 +247,12 @@ impl Emulator {
         }
         Some(sym.unwrap())
     }
-    pub fn run(&mut self, inputs: [Buttons; 2]) {
+    pub fn run(&mut self, inputs: [InputPort; 2]) {
         unsafe {
             //clear audio buffers and whatever else
             (*CONTEXT).audio_sample.clear();
             //set inputs on CB
-            (*CONTEXT).buttons = inputs;
+            (*CONTEXT).input_ports = inputs;
             //run one step
             ((*EMULATOR).core.retro_run)()
         }
@@ -246,7 +262,7 @@ impl Emulator {
             //clear audio buffers and whatever else
             (*CONTEXT).audio_sample.clear();
             //clear inputs on CB
-            (*CONTEXT).buttons = [Buttons::new(), Buttons::new()];
+            (*CONTEXT).input_ports = [InputPort::new(), InputPort::new()];
             //clear fb
             (*CONTEXT).frame_ptr = ptr::null();
             ((*EMULATOR).core.retro_reset)()
@@ -364,7 +380,7 @@ impl Emulator {
     pub fn framebuffer_pitch(&self) -> usize {
         unsafe { (*CONTEXT).frame_pitch }
     }
-    fn peek_framebuffer<FBPeek, FBPeekRet>(&self, f: FBPeek) -> Result<FBPeekRet, RetroRsError>
+    pub fn peek_framebuffer<FBPeek, FBPeekRet>(&self, f: FBPeek) -> Result<FBPeekRet, RetroRsError>
     where
         FBPeek: FnOnce(&[u8]) -> FBPeekRet,
     {
@@ -378,6 +394,16 @@ impl Emulator {
                 );
                 Ok(f(frame_slice))
             }
+        }
+    }
+
+    pub fn peek_audio_buffer<F, R>(&self, f: F) -> Result<R, RetroRsError>
+    where
+        F: FnOnce(&[i16]) -> R,
+    {
+        unsafe {
+            let slice = &(*CONTEXT).audio_sample[..];
+            Ok(f(slice))
         }
     }
 
@@ -407,305 +433,13 @@ impl Emulator {
             )
         }
     }
-    pub fn get_pixel(&self, x: usize, y: usize) -> Result<(u8, u8, u8), RetroRsError> {
-        let (w, _h) = self.framebuffer_size();
-        self.peek_framebuffer(move |fb| match self.pixel_format() {
-            PixelFormat::ARGB1555 => {
-                let start = y * w + x;
-                let gb = fb[start * 2];
-                let arg = fb[start * 2 + 1];
-                let (red, green, blue) = argb555to888(gb, arg);
-                (red, green, blue)
-            }
-            PixelFormat::ARGB8888 => {
-                let off = (y * w + x) * 4;
-                (fb[off + 1], fb[off + 2], fb[off + 3])
-            }
-            PixelFormat::RGB565 => {
-                let start = y * w + x;
-                let gb = fb[start * 2];
-                let rg = fb[start * 2 + 1];
-                let (red, green, blue) = rgb565to888(gb, rg);
-                (red, green, blue)
-            }
-        })
+
+    pub fn system_info(&self) -> &SystemInfo {
+        &self.system_info
     }
-    #[allow(clippy::many_single_char_names)]
-    pub fn for_each_pixel(
-        &self,
-        mut f: impl FnMut(usize, usize, u8, u8, u8),
-    ) -> Result<(), RetroRsError> {
-        let (w, h) = self.framebuffer_size();
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            let mut x = 0;
-            let mut y = 0;
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for components in fb.chunks_exact(2) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        f(x, y, red, green, blue);
-                        x += 1;
-                        if x >= w {
-                            y += 1;
-                            x = 0;
-                        }
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for components in fb.chunks_exact(4) {
-                        let red = components[1];
-                        let green = components[2];
-                        let blue = components[3];
-                        f(x, y, red, green, blue);
-                        x += 1;
-                        if x >= w {
-                            y += 1;
-                            x = 0;
-                        }
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for components in fb.chunks_exact(2) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        f(x, y, red, green, blue);
-                        x += 1;
-                        if x >= w {
-                            y += 1;
-                            x = 0;
-                        }
-                    }
-                }
-            };
-            assert_eq!(y, h);
-            assert_eq!(x, 0);
-        })
-    }
-    pub fn copy_framebuffer_rgb888(&self, slice: &mut [u8]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(3)) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        dst[0] = red;
-                        dst[1] = green;
-                        dst[2] = blue;
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.chunks_exact_mut(3)) {
-                        let r = components[1];
-                        let g = components[2];
-                        let b = components[3];
-                        dst[0] = r;
-                        dst[1] = g;
-                        dst[2] = b;
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(3)) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        dst[0] = red;
-                        dst[1] = green;
-                        dst[2] = blue;
-                    }
-                }
-            };
-        })
-    }
-    pub fn copy_framebuffer_rgba8888(&self, slice: &mut [u8]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(4)) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        dst[0] = red;
-                        dst[1] = green;
-                        dst[2] = blue;
-                        dst[3] = (arg >> 7) * 0xFF;
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.chunks_exact_mut(4)) {
-                        let a = components[0];
-                        let r = components[1];
-                        let g = components[2];
-                        let b = components[3];
-                        dst[0] = r;
-                        dst[1] = g;
-                        dst[2] = b;
-                        dst[3] = a;
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(4)) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        dst[0] = red;
-                        dst[1] = green;
-                        dst[2] = blue;
-                        dst[3] = 0xFF;
-                    }
-                }
-            };
-        })
-    }
-    pub fn copy_framebuffer_rgb332(&self, slice: &mut [u8]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        *dst = rgb888_to_rgb332(red, green, blue);
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.iter_mut()) {
-                        let r = components[1];
-                        let g = components[2];
-                        let b = components[3];
-                        *dst = rgb888_to_rgb332(r, g, b);
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        *dst = rgb888_to_rgb332(red, green, blue);
-                    }
-                }
-            };
-        })
-    }
-    pub fn copy_framebuffer_argb32(&self, slice: &mut [u32]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        *dst = (0xFF00_0000 * (u32::from(arg) >> 7))
-                            | (u32::from(red) << 16)
-                            | (u32::from(green) << 8)
-                            | u32::from(blue);
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.iter_mut()) {
-                        *dst = (u32::from(components[0]) << 24)
-                            | (u32::from(components[1]) << 16)
-                            | (u32::from(components[2]) << 8)
-                            | u32::from(components[3]);
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        *dst = 0xFF00_0000
-                            | (u32::from(red) << 16)
-                            | (u32::from(green) << 8)
-                            | u32::from(blue);
-                    }
-                }
-            };
-        })
-    }
-    pub fn copy_framebuffer_rgba32(&self, slice: &mut [u32]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        *dst = (u32::from(red) << 24)
-                            | (u32::from(green) << 16)
-                            | (u32::from(blue) << 8)
-                            | (u32::from(arg >> 7) * 0x0000_00FF);
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.iter_mut()) {
-                        *dst = (u32::from(components[1]) << 24)
-                            | (u32::from(components[2]) << 16)
-                            | (u32::from(components[3]) << 8)
-                            | u32::from(components[0]);
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.iter_mut()) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        *dst = (u32::from(red) << 24)
-                            | (u32::from(green) << 16)
-                            | (u32::from(blue) << 8)
-                            | 0x0000_00FF;
-                    }
-                }
-            };
-        })
-    }
-    pub fn copy_framebuffer_rgba_f32x4(&self, slice: &mut [f32]) -> Result<(), RetroRsError> {
-        let fmt = self.pixel_format();
-        self.peek_framebuffer(move |fb| {
-            match fmt {
-                PixelFormat::ARGB1555 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(4)) {
-                        let gb = components[0];
-                        let arg = components[1];
-                        let (red, green, blue) = argb555to888(gb, arg);
-                        let alpha = (arg >> 7) as f32;
-                        dst[0] = red as f32 / 255.;
-                        dst[1] = green as f32 / 255.;
-                        dst[2] = blue as f32 / 255.;
-                        dst[3] = alpha;
-                    }
-                }
-                PixelFormat::ARGB8888 => {
-                    for (components, dst) in fb.chunks_exact(4).zip(slice.chunks_exact_mut(4)) {
-                        dst[0] = components[0] as f32 / 255.;
-                        dst[1] = components[1] as f32 / 255.;
-                        dst[2] = components[2] as f32 / 255.;
-                        dst[3] = components[3] as f32 / 255.;
-                    }
-                }
-                PixelFormat::RGB565 => {
-                    for (components, dst) in fb.chunks_exact(2).zip(slice.chunks_exact_mut(4)) {
-                        let gb = components[0];
-                        let rg = components[1];
-                        let (red, green, blue) = rgb565to888(gb, rg);
-                        let alpha = 1.;
-                        dst[0] = red as f32 / 255.;
-                        dst[1] = green as f32 / 255.;
-                        dst[2] = blue as f32 / 255.;
-                        dst[3] = alpha;
-                    }
-                }
-            };
-        })
+
+    pub fn system_av_info(&self) -> &SystemAvInfo {
+        &self.system_av_info
     }
 }
 
@@ -729,7 +463,8 @@ unsafe extern "C" fn callback_environment(cmd: u32, data: *mut c_void) -> bool {
                 true
             }
             ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
-                *(data as *mut *const c_char) = (*EMULATOR).core_path.as_ptr();
+                *(data as *mut *const c_char) = (*EMULATOR).system_path.as_ptr();
+                println!("{}", (*EMULATOR).system_path.to_str().unwrap());
                 true
             }
             ENVIRONMENT_GET_CAN_DUPE => {
@@ -745,6 +480,88 @@ unsafe extern "C" fn callback_environment(cmd: u32, data: *mut c_void) -> bool {
                 // So we had better copy it
                 (*CONTEXT).memory_map.extend_from_slice(desc_slice);
                 // (Implicitly we also want to drop the old one, which we did by reassigning)
+                true
+            }
+
+            // Added by Aldo Acevedo (2022)
+            ENVIRONMENT_GET_VARIABLE => {
+                let variable = data as *const Variable;
+                let key = CStr::from_ptr((*(variable)).key).to_str().unwrap();
+
+                let value = match key {
+                    //"pcsx2_bios" => Some("SCPH-39001 NA 160-mar.bin"),
+                    "pcsx2_fastboot" => Some("disabled"),
+                    "pcsx2_memcard_slot_1" => Some("shared8"),
+                    "pcsx2_memcard_slot_2" => Some("empty"),
+                    "pcsx2_renderer" => Some("Auto"),
+
+                    "pcsx2_upscale_multiplier" => Some("1"),
+                    "pcsx2_palette_conversion" => Some("disabled"),
+                    "pcsx2_userhack_fb_conversion" => Some("disabled"),
+                    "pcsx2_userhack_auto_flush" => Some("disabled"),
+                    "pcsx2_fast_invalidation" => Some("disabled"),
+                    "pcsx2_speedhacks_presets" => Some("1"),
+                    "pcsx2_fastcdvd" => Some("disabled"),
+                    "pcsx2_deinterlace_mode" => Some("7"),
+                    "pcsx2_enable_60fps_patches" => Some("disabled"),
+                    "pcsx2_enable_widescreen_patches" => Some("disabled"),
+                    "pcsx2_frameskip" => Some("disabled"),
+                    "pcsx2_frames_to_draw" => Some("1"),
+                    "pcsx2_frames_to_skip" => Some("1"),
+                    "pcsx2_vsync_mtgs_queue" => Some("2"),
+                    "pcsx2_enable_cheats" => Some("disabled"),
+                    "pcsx2_clamping_mode" => Some("1"),
+                    "pcsx2_round_mode" => Some("3"),
+                    "pcsx2_vu_clamping_mode" => Some("1"),
+                    "pcsx2_vu_round_mode" => Some("3"),
+                    "pcsx2_gamepad_l_deadzone" => Some("0"),
+                    "pcsx2_gamepad_r_deadzone" => Some("0"),
+                    "pcsx2_rumble_intensity" => Some("100"),
+                    "pcsx2_rumble_enable" => Some("enabled"),
+
+                    "beetle_psx_renderer" => Some("software"),
+                    "beetle_psx_hw_renderer" => Some("software"),
+
+                    "desmume_pointer_mouse" => Some("enabled"),
+                    "desmume_pointer_device_l" => Some("absolute"),
+                    "desmume_pointer_device_r" => Some("absolute"),
+                    //"desmume_pointer_type" => Some("touch"),
+                    key => {
+                        eprintln!("INTERNAL: Unrecognized variable: {}", key);
+                        None
+                    }
+                };
+
+                // Successful if value isn't null
+                value.is_some()
+            }
+            ENVIRONMENT_GET_LOG_INTERFACE => {
+                // Variadic C print function
+                unsafe extern "C" fn log_function(
+                    level: LogLevel,
+                    fmt: *const libc::c_char,
+                    mut args: ...
+                ) {
+                    let level = match level {
+                        LogLevel::Debug => "DEBUG",
+                        LogLevel::Info => "INFO",
+                        LogLevel::Warn => "WARN",
+                        LogLevel::Error => "ERROR",
+                    };
+                    let format_args = printf_compat::output::display(fmt, args.as_va_list());
+                    eprint!("{}: {}", level, format_args);
+                }
+
+                let log_callback = data as *mut LogCallback;
+                (*log_callback).log = log_function;
+                true
+            }
+            ENVIRONMENT_SET_MESSAGE => {
+                let msg = data as *const Message;
+                eprint!(
+                    "--- MESSAGE: {}",
+                    CStr::from_ptr((*msg).msg).to_str().unwrap()
+                );
                 true
             }
             _ => false,
@@ -787,22 +604,77 @@ extern "C" fn callback_audio_sample_batch(data: *const i16, frames: usize) -> us
 extern "C" fn callback_input_poll() {}
 
 extern "C" fn callback_input_state(port: u32, device: u32, index: u32, id: u32) -> i16 {
-    // Can't panic
-    if port > 1 || device != 1 || index != 0 {
-        // Unsupported port/device/index
-        println!("Unsupported port/device/index");
+    if port > 1 {
+        println!(
+            "Unsupported port {} (only two controllers are implemented)",
+            port
+        );
         return 0;
     }
-    let id = id;
+
     let port = port as usize;
-    if id > 16 {
-        println!("Unexpected button id {}", id);
-        return 0;
-    }
-    unsafe {
-        if (*CONTEXT).buttons[port].get(id) {
-            1
-        } else {
+
+    match (device, index, id) {
+        // RETRO_DEVICE_NONE         0
+        (DEVICE_NONE, ..) => 0,
+        // RETRO_DEVICE_JOYPAD       1
+        (DEVICE_JOYPAD, 0, id) => {
+            if id > 16 {
+                println!("Unexpected button id {}", id);
+                return 0;
+            }
+            unsafe {
+                if (*CONTEXT).input_ports[port].buttons.get(id) {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+        // RETRO_DEVICE_MOUSE        2
+        (DEVICE_MOUSE, 0, id) => unsafe {
+            println!("MOUSE REQUESTED!!!!");
+            let left = (*CONTEXT).input_ports[port].mouse_left_down;
+            let right = (*CONTEXT).input_ports[port].mouse_right_down;
+            let middle = (*CONTEXT).input_ports[port].mouse_middle_down;
+            let bool_to_i16 = |b| if b { 1 } else { 0 };
+
+            match id {
+                DEVICE_ID_MOUSE_X => (*CONTEXT).input_ports[port].mouse_x,
+                DEVICE_ID_MOUSE_Y => (*CONTEXT).input_ports[port].mouse_y,
+                DEVICE_ID_MOUSE_LEFT => bool_to_i16(left),
+                DEVICE_ID_MOUSE_RIGHT => bool_to_i16(right),
+                DEVICE_ID_MOUSE_MIDDLE => bool_to_i16(middle),
+                _ => 0,
+            }
+        },
+        // RETRO_DEVICE_KEYBOARD     3
+        (DEVICE_KEYBOARD, ..) => {
+            println!("Keyboard input method unsupported");
+            0
+        }
+        // RETRO_DEVICE_LIGHTGUN     4
+        (DEVICE_LIGHTGUN, ..) => {
+            println!("Lightgun input method unsupported");
+            0
+        }
+        // RETRO_DEVICE_ANALOG       5
+        //(DEVICE_ANALOG, DEVICE_INDEX_ANALOG_LEFT, DEVICE_ID_JOYPAD_X) => unsafe { (*CONTEXT).input_ports[port].joystick_x },
+        //(DEVICE_ANALOG, DEVICE_INDEX_ANALOG_LEFT, DEVICE_ID_JOYPAD_Y) => unsafe { (*CONTEXT).input_ports[port].joystick_y },
+        // Right not yet implemented
+        (DEVICE_ANALOG, DEVICE_INDEX_ANALOG_LEFT, DEVICE_ID_ANALOG_X) => unsafe {
+            (*CONTEXT).input_ports[port].joystick_x
+        },
+        (DEVICE_ANALOG, DEVICE_INDEX_ANALOG_LEFT, DEVICE_ID_ANALOG_Y) => unsafe {
+            (*CONTEXT).input_ports[port].joystick_y
+        },
+        // RETRO_DEVICE_POINTER      6
+        (6, ..) => {
+            println!("Pointer input method unsupported");
+            0
+        }
+        _ => {
+            println!("Unsupported device/index/id ({}/{}/{})", device, index, id);
             0
         }
     }
@@ -823,71 +695,5 @@ impl Drop for Emulator {
             EMULATOR = ptr::null_mut();
         }
         // let them drop naturally
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    #[cfg(feature = "use_image")]
-    extern crate image;
-    #[cfg(feature = "use_image")]
-    use crate::fb_to_image::*;
-
-    fn mario_is_dead(emu: &Emulator) -> bool {
-        emu.system_ram_ref()[0x0770] == 0x03
-    }
-
-    const PPU_BIT: usize = 1 << 31;
-
-    fn get_byte(emu: &Emulator, addr: usize) -> u8 {
-        emu.memory_ref(addr).expect("Couldn't read RAM!")[0]
-    }
-
-    #[cfg(feature = "use_image")]
-    #[test]
-    fn it_works() {
-        // TODO change to a public domain rom or maybe 2048 core or something
-        let mut emu = Emulator::create(
-            Path::new("../mechlearn/mappy/cores/fceumm_libretro"),
-            Path::new("roms/mario.nes"),
-        );
-        emu.run([Buttons::new(), Buttons::new()]);
-        emu.reset();
-        for i in 0..150 {
-            emu.run([
-                Buttons::new()
-                    .start(i > 80 && i < 100)
-                    .right(i >= 100)
-                    .a(i >= 100),
-                Buttons::new(),
-            ]);
-        }
-        let fb = emu.create_imagebuffer();
-        fb.unwrap().save("out.png").unwrap();
-        let mut died = false;
-        for _ in 0..10000 {
-            emu.run([Buttons::new().right(true), Buttons::new()]);
-            if mario_is_dead(&emu) {
-                died = true;
-                let fb = emu.create_imagebuffer();
-                fb.unwrap().save("out2.png").unwrap();
-                break;
-            }
-        }
-        assert!(died);
-        emu.reset();
-        for i in 0..250 {
-            emu.run([
-                Buttons::new()
-                    .start(i > 80 && i < 100)
-                    .right(i >= 100)
-                    .a((i >= 100 && i <= 150) || (i >= 180)),
-                Buttons::new(),
-            ]);
-        }
-
-        //emu will drop naturally
     }
 }

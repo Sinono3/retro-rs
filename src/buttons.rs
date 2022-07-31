@@ -6,6 +6,24 @@ use libretro_sys::{
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
+pub struct InputPort {
+    pub buttons: Buttons,
+    pub joystick_x: i16,
+    pub joystick_y: i16,
+    pub mouse_x: i16,
+    pub mouse_y: i16,
+    pub mouse_left_down: bool,
+    pub mouse_right_down: bool,
+    pub mouse_middle_down: bool,
+}
+
+impl InputPort {
+    pub fn new() -> Self {
+        InputPort::default()
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
 pub struct Buttons(i16);
 
 impl Buttons {
