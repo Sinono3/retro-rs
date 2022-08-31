@@ -69,97 +69,19 @@ impl Emulator {
             assert!(EMULATOR.is_null());
             assert!(CONTEXT.is_null());
         }
-        let suffix = if cfg!(target_os = "windows") {
-            "dll"
-        } else if cfg!(target_os = "macos") {
-            "dylib"
-        } else if cfg!(target_os = "linux") {
-            "so"
-        } else {
-            panic!("Unsupported platform")
+
+        let (dll, core) = Self::create_core(core_path);
+
+        let emu = EmulatorCore {
+            core_lib: dll,
+            rom_path: CString::new(rom_path.to_str().unwrap()).unwrap(),
+            core_path: CString::new(core_path.to_str().unwrap()).unwrap(),
+            system_path: { CString::new(core_path.with_extension("").to_str().unwrap()).unwrap() },
+            core: core.clone(),
+            _marker: PhantomData,
         };
-        let path: PathBuf = core_path.with_extension(suffix);
-        #[cfg(target_os = "linux")]
-        let library: Library = {
-            // Load library with `RTLD_NOW | RTLD_NODELETE` to fix a SIGSEGV
-            ::libloading::os::unix::Library::open(Some(path), 0x2 | 0x1000)
-                .unwrap()
-                .into()
-        };
-        #[cfg(not(target_os = "linux"))]
-        let library = Library::new(path).unwrap();
-        let dll = Box::new(library);
+
         unsafe {
-            let retro_set_environment = *(dll.get(b"retro_set_environment").unwrap());
-            let retro_set_video_refresh = *(dll.get(b"retro_set_video_refresh").unwrap());
-            let retro_set_audio_sample = *(dll.get(b"retro_set_audio_sample").unwrap());
-            let retro_set_audio_sample_batch = *(dll.get(b"retro_set_audio_sample_batch").unwrap());
-            let retro_set_input_poll = *(dll.get(b"retro_set_input_poll").unwrap());
-            let retro_set_input_state = *(dll.get(b"retro_set_input_state").unwrap());
-            let retro_init = *(dll.get(b"retro_init").unwrap());
-            let retro_deinit = *(dll.get(b"retro_deinit").unwrap());
-            let retro_api_version = *(dll.get(b"retro_api_version").unwrap());
-            let retro_get_system_info = *(dll.get(b"retro_get_system_info").unwrap());
-            let retro_get_system_av_info = *(dll.get(b"retro_get_system_av_info").unwrap());
-            let retro_set_controller_port_device =
-                *(dll.get(b"retro_set_controller_port_device").unwrap());
-            let retro_reset = *(dll.get(b"retro_reset").unwrap());
-            let retro_run = *(dll.get(b"retro_run").unwrap());
-            let retro_serialize_size = *(dll.get(b"retro_serialize_size").unwrap());
-            let retro_serialize = *(dll.get(b"retro_serialize").unwrap());
-            let retro_unserialize = *(dll.get(b"retro_unserialize").unwrap());
-            let retro_cheat_reset = *(dll.get(b"retro_cheat_reset").unwrap());
-            let retro_cheat_set = *(dll.get(b"retro_cheat_set").unwrap());
-            let retro_load_game = *(dll.get(b"retro_load_game").unwrap());
-            let retro_load_game_special = *(dll.get(b"retro_load_game_special").unwrap());
-            let retro_unload_game = *(dll.get(b"retro_unload_game").unwrap());
-            let retro_get_region = *(dll.get(b"retro_get_region").unwrap());
-            let retro_get_memory_data = *(dll.get(b"retro_get_memory_data").unwrap());
-            let retro_get_memory_size = *(dll.get(b"retro_get_memory_size").unwrap());
-            let emu = EmulatorCore {
-                core_lib: dll,
-                rom_path: CString::new(rom_path.to_str().unwrap()).unwrap(),
-                core_path: CString::new(core_path.to_str().unwrap()).unwrap(),
-                system_path: {
-                    CString::new(core_path.with_extension("").to_str().unwrap()).unwrap()
-                },
-                core: CoreAPI {
-                    retro_set_environment,
-                    retro_set_video_refresh,
-                    retro_set_audio_sample,
-                    retro_set_audio_sample_batch,
-                    retro_set_input_poll,
-                    retro_set_input_state,
-
-                    retro_init,
-                    retro_deinit,
-
-                    retro_api_version,
-
-                    retro_get_system_info,
-                    retro_get_system_av_info,
-                    retro_set_controller_port_device,
-
-                    retro_reset,
-                    retro_run,
-
-                    retro_serialize_size,
-                    retro_serialize,
-                    retro_unserialize,
-
-                    retro_cheat_reset,
-                    retro_cheat_set,
-
-                    retro_load_game,
-                    retro_load_game_special,
-                    retro_unload_game,
-
-                    retro_get_region,
-                    retro_get_memory_data,
-                    retro_get_memory_size,
-                },
-                _marker: PhantomData,
-            };
             let emup = Box::new(emu);
             // Store a pointer to the data
             EMULATOR = Box::leak(emup);
@@ -226,8 +148,8 @@ impl Emulator {
                 },
             };
 
-            (retro_get_system_info)(&mut system_info);
-            (retro_get_system_av_info)(&mut system_av_info);
+            (core.retro_get_system_info)(&mut system_info);
+            (core.retro_get_system_av_info)(&mut system_av_info);
 
             Emulator {
                 phantom: PhantomData,
@@ -236,6 +158,112 @@ impl Emulator {
             }
         }
     }
+
+    pub fn create_for_extensions(core_path: &Path) -> CString {
+        let (_, core) = Self::create_core(core_path);
+        let mut system_info = SystemInfo {
+            library_name: ptr::null(),
+            library_version: ptr::null(),
+            valid_extensions: ptr::null(),
+            need_fullpath: false,
+            block_extract: false,
+        };
+
+        unsafe {
+            (core.retro_get_system_info)(&mut system_info);
+            CStr::from_ptr(system_info.valid_extensions).to_owned()
+        }
+    }
+
+    fn create_core(core_path: &Path) -> (Box<Library>, CoreAPI) {
+        let suffix = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "linux") {
+            "so"
+        } else {
+            panic!("Unsupported platform")
+        };
+        let path: PathBuf = core_path.with_extension(suffix);
+        #[cfg(target_os = "linux")]
+        let library: Library = {
+            // Load library with `RTLD_NOW | RTLD_NODELETE` to fix a SIGSEGV
+            ::libloading::os::unix::Library::open(Some(path), 0x2 | 0x1000)
+                .unwrap()
+                .into()
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let library = Library::new(path).unwrap();
+        let dll = Box::new(library);
+
+        unsafe {
+            let retro_set_environment = *(dll.get(b"retro_set_environment").unwrap());
+            let retro_set_video_refresh = *(dll.get(b"retro_set_video_refresh").unwrap());
+            let retro_set_audio_sample = *(dll.get(b"retro_set_audio_sample").unwrap());
+            let retro_set_audio_sample_batch = *(dll.get(b"retro_set_audio_sample_batch").unwrap());
+            let retro_set_input_poll = *(dll.get(b"retro_set_input_poll").unwrap());
+            let retro_set_input_state = *(dll.get(b"retro_set_input_state").unwrap());
+            let retro_init = *(dll.get(b"retro_init").unwrap());
+            let retro_deinit = *(dll.get(b"retro_deinit").unwrap());
+            let retro_api_version = *(dll.get(b"retro_api_version").unwrap());
+            let retro_get_system_info = *(dll.get(b"retro_get_system_info").unwrap());
+            let retro_get_system_av_info = *(dll.get(b"retro_get_system_av_info").unwrap());
+            let retro_set_controller_port_device =
+                *(dll.get(b"retro_set_controller_port_device").unwrap());
+            let retro_reset = *(dll.get(b"retro_reset").unwrap());
+            let retro_run = *(dll.get(b"retro_run").unwrap());
+            let retro_serialize_size = *(dll.get(b"retro_serialize_size").unwrap());
+            let retro_serialize = *(dll.get(b"retro_serialize").unwrap());
+            let retro_unserialize = *(dll.get(b"retro_unserialize").unwrap());
+            let retro_cheat_reset = *(dll.get(b"retro_cheat_reset").unwrap());
+            let retro_cheat_set = *(dll.get(b"retro_cheat_set").unwrap());
+            let retro_load_game = *(dll.get(b"retro_load_game").unwrap());
+            let retro_load_game_special = *(dll.get(b"retro_load_game_special").unwrap());
+            let retro_unload_game = *(dll.get(b"retro_unload_game").unwrap());
+            let retro_get_region = *(dll.get(b"retro_get_region").unwrap());
+            let retro_get_memory_data = *(dll.get(b"retro_get_memory_data").unwrap());
+            let retro_get_memory_size = *(dll.get(b"retro_get_memory_size").unwrap());
+            let core = CoreAPI {
+                retro_set_environment,
+                retro_set_video_refresh,
+                retro_set_audio_sample,
+                retro_set_audio_sample_batch,
+                retro_set_input_poll,
+                retro_set_input_state,
+
+                retro_init,
+                retro_deinit,
+
+                retro_api_version,
+
+                retro_get_system_info,
+                retro_get_system_av_info,
+                retro_set_controller_port_device,
+
+                retro_reset,
+                retro_run,
+
+                retro_serialize_size,
+                retro_serialize,
+                retro_unserialize,
+
+                retro_cheat_reset,
+                retro_cheat_set,
+
+                retro_load_game,
+                retro_load_game_special,
+                retro_unload_game,
+
+                retro_get_region,
+                retro_get_memory_data,
+                retro_get_memory_size,
+            };
+            (dll, core)
+        }
+    }
+
     pub fn get_library(&mut self) -> &Library {
         unsafe { &(*EMULATOR).core_lib }
     }
