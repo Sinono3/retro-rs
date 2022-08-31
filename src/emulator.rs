@@ -1,16 +1,12 @@
-use crate::buttons::Buttons;
 use crate::buttons::InputPort;
 use crate::error::*;
-use crate::pixels::*;
 use libc::c_char;
-use libc::c_int;
 use libloading::Library;
 use libloading::Symbol;
 use libretro_sys::*;
 use std::ffi::{c_void, CStr, CString};
 use std::fs::File;
 use std::io::Read;
-use std::io::Write;
 use std::marker::PhantomData;
 use std::panic;
 use std::path::{Path, PathBuf};
@@ -23,6 +19,7 @@ static mut CONTEXT: *mut EmulatorContext = ptr::null_mut();
 
 struct EmulatorCore {
     core_lib: Box<Library>,
+    #[allow(dead_code)]
     core_path: CString,
     system_path: CString,
     rom_path: CString,
