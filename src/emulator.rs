@@ -60,6 +60,11 @@ pub struct Emulator {
     system_av_info: SystemAvInfo,
 }
 
+pub struct RetroSystemInfo {
+    pub library_name: CString,
+    pub extensions: CString,
+}
+
 impl Emulator {
     pub fn create(core_path: &Path, rom_path: &Path) -> Emulator {
         unsafe {
@@ -156,7 +161,7 @@ impl Emulator {
         }
     }
 
-    pub fn create_for_extensions(core_path: &Path) -> CString {
+    pub fn create_for_system_info(core_path: &Path) -> RetroSystemInfo {
         let (_, core) = Self::create_core(core_path);
         let mut system_info = SystemInfo {
             library_name: ptr::null(),
@@ -166,9 +171,14 @@ impl Emulator {
             block_extract: false,
         };
 
+        let to_cstring = |ptr| unsafe { CStr::from_ptr(ptr).to_owned() };
+
         unsafe {
             (core.retro_get_system_info)(&mut system_info);
-            CStr::from_ptr(system_info.valid_extensions).to_owned()
+            RetroSystemInfo {
+                library_name: to_cstring(system_info.library_name),
+                extensions: to_cstring(system_info.valid_extensions),
+            }
         }
     }
 
