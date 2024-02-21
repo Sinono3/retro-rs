@@ -7,6 +7,7 @@ pub use emulator::Emulator;
 mod error;
 pub use error::*;
 pub mod pixels;
+pub use libretro_sys;
 
 #[cfg(feature = "use_image")]
 mod fb_to_image;

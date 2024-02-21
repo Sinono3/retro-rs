@@ -555,12 +555,14 @@ unsafe extern "C" fn callback_environment(cmd: u32, data: *mut c_void) -> bool {
                     "pcsx2_rumble_enable" => Some("enabled"),
 
                     "beetle_psx_renderer" => Some("software"),
-                    "beetle_psx_hw_renderer" => Some("software"),
+                    "beetle_psx_aspect_ratio" => Some("uncorrected"),
+                    "beetle_psx_skip_bios" => Some("enabled"),
+                    "beetle_psx_crop_overscan" => Some("enabled"),
 
                     "desmume_pointer_mouse" => Some("enabled"),
                     "desmume_pointer_device_l" => Some("absolute"),
                     "desmume_pointer_device_r" => Some("absolute"),
-                    //"desmume_pointer_type" => Some("touch"),
+
                     key => {
                         eprintln!("INTERNAL: Unrecognized variable: {}", key);
                         None
